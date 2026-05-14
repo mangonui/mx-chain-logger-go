@@ -3,6 +3,7 @@ package logger
 import (
 	"fmt"
 	"io"
+	"os"
 	"sync"
 	"unicode/utf8"
 
@@ -41,7 +42,19 @@ func (los *logOutputSubject) Output(line *LogLine) {
 	for i := 0; i < len(los.writers); i++ {
 		format := los.formatters[i]
 		buff := format.Output(convertedLine)
-		_, _ = los.writers[i].Write(buff)
+		_, writeErr := los.writers[i].Write(buff)
+		if writeErr != nil {
+			// ISSUE-051: surface observer write failures so they don't
+			// silently drop log lines. We write to os.Stderr directly
+			// (NOT via the logger) to avoid the recursion an Output()
+			// call from within Output() would trigger. Fail-loud beats
+			// silent log loss when the underlying file/pipe/network
+			// observer is unhealthy. Keeps the loop going so a single
+			// bad observer doesn't take down the rest.
+			_, _ = fmt.Fprintf(os.Stderr,
+				"logOutputSubject: observer #%d write failed: %v\n",
+				i, writeErr)
+		}
 	}
 
 	los.mutObservers.RUnlock()

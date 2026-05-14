@@ -74,8 +74,16 @@ func NewFileLogging(args ArgsFileLogging) (*fileLogging, error) {
 
 	// we need this function as to call file.Close() when the code panics and the deferred function associated
 	// with the file pointer in the main func will never be reached
+	//
+	// ISSUE-049: currentFile may legitimately be nil here (recreateLogFile
+	// above logs and returns early if file creation or observer
+	// registration fails). Without this guard the finalizer would panic on
+	// nil-dereference, which is worst-possible behaviour for a process-exit
+	// path. Nil-check, then close.
 	runtime.SetFinalizer(fl, func(fileLogHandler *fileLogging) {
-		_ = fileLogHandler.currentFile.Close()
+		if fileLogHandler.currentFile != nil {
+			_ = fileLogHandler.currentFile.Close()
+		}
 	})
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
@@ -110,6 +118,15 @@ func (fl *fileLogging) recreateLogFile() {
 	oldFile := fl.currentFile
 	err = logger.AddLogObserver(newFile, &logger.PlainFormatter{})
 	if err != nil {
+		// ISSUE-050: previously this returned without closing newFile,
+		// leaking the underlying file descriptor on every rotation
+		// attempt that failed observer registration. On a long-running
+		// node with one rotation per day, this is one FD per day until
+		// the process hits its rlimit. Close newFile before returning;
+		// the existing oldFile (if any) stays in place via the
+		// no-state-mutation path below.
+		closeErr := newFile.Close()
+		log.LogIfError(closeErr, "step", "closing new file after AddLogObserver failed")
 		log.Error("error adding log observer", "error", err)
 		return
 	}
@@ -216,8 +233,17 @@ func (fl *fileLogging) Close() error {
 	fl.isClosed = true
 	fl.mutIsClosed.Unlock()
 
+	// ISSUE-049: currentFile may legitimately be nil if every prior
+	// recreateLogFile() attempt failed (createFile error or
+	// AddLogObserver error short-circuits without ever assigning
+	// fl.currentFile). Closing an already-nil-recovered Close() must
+	// still tear down the spanners and cancelFunc, but must not
+	// nil-dereference on the file pointer.
 	fl.mutOperation.Lock()
-	err := fl.currentFile.Close()
+	var err error
+	if fl.currentFile != nil {
+		err = fl.currentFile.Close()
+	}
 	fl.mutOperation.Unlock()
 
 	fl.cancelFunc()
